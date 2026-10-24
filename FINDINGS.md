@@ -48,11 +48,11 @@ address.
 | What | Where |
 |---|---|
 | Game mode | `0x8292E66C`. The battle (round call, fight, KO, replay, between rounds) is modes 3, 4, 5, 6 and 10 |
-| Fight player objects | `*(0x828DCE88)` (P1) and `*(0x828DCE8C)` (P2), `0xC40` bytes. Position x at `+0x0`, z at `+0x8` |
+| Fight player objects | `*(0x828DCE88)` (P1) and `*(0x828DCE8C)` (P2), `0xC40` bytes. Position x at `+0x0`, z at `+0x8`; these words move in steps (see [The turned camera](#the-camera)) |
 | Player index | player `+76`: 0 or 1, read from pad 8 or 9 |
 | Task tree | root `0x82828C60`, child / sibling links at `+16..+40`; task objects in `0xA7290000-0xABA90000` |
 
-## The camera and the mirror
+## The camera
 
 - The camera manager `sub_8231C488` sets up the views once a frame, the active camera first, through `sub_8231CFE0`.
   That call has lr `0x8231C7FC`.
@@ -90,15 +90,14 @@ Results (two local instances, P1's screen as built):
 | Same, P1 without the DLL (`T6_SIDE_SWAP=0`), random input | as above | 0 of 4238 frames |
 
 **The turned camera (0.1).** Version 0.1 turned the active camera half round about its up axis through its target
-(`eye' = target + 2 (d.u) u - d`, `d = eye - target`) for the view setup and the draw root. That has two flaws the
-mirror doesn't have:
+(`eye' = target + 2 (d.u) u - d`, `d = eye - target`) for the view setup and the draw root, and turned player 2's side
+in both games (see [Sidesteps](#sidesteps)).
 
-- **Framing.** Reported by a player: when player 1 backed far away, he ended up behind player 2's turned camera.
-  [INFERENCE: the camera's target is not the middle of the fighters, so the turned camera frames them differently.]
-- **Sidesteps.** From the other side, the game's background is player 2's foreground. Fixing that needs player 2's
-  side turned in both games' simulation (see [Sidesteps](#sidesteps)). Even then, each player sees the other's up
-  sidesteps go toward his own camera, because the two cameras face each other. Players reported the sidesteps still
-  wrong with 0.1.
+- Reports against 0.1 (sidesteps wrong, player 1 behind player 2's camera when backing far away) came from a player 2
+  PC that still ran a build from before 0.1: its `winmm.dll` was 70.5 KB (SHA-256 `f7f59f37...`) and its
+  `side_swap.log` had no side update hook, so that build turned the camera but never player 2's side.
+- 0.2 replaced the turned camera with the mirror on a wrong diagnosis (that the two turned cameras facing each other
+  make the sidesteps wrong).
 
 Approaches that failed before 0.1:
 
@@ -109,6 +108,27 @@ Approaches that failed before 0.1:
 - **Mirroring the look-at result** inside `sub_82307CF0` (lr `0x82307D8C`) gave wrong culling and lighting. That was
   before the cull mode setter was known; mirroring the projection instead leaves view space as it is.
 
+**The turned camera (0.3).** Players did not want the mirrored picture. 0.3 turns the camera again, with 0.1's side
+turn:
+
+- **Pivot**: the vertical through the camera's target. `eye.xz' = 2 target.xz - eye.xz`, y kept, up's x and z
+  negated. Over a fight (2591 frames): eye to target 4600 (up to 6779); the camera is level (eye y - target y,
+  median 0); the middle of the fighters' position words is within ±482 of the target in depth and ±915 across
+  (median 7 and 24).
+- **Not the middle of the fighters**: their position words move in steps. Walking back, player 1's moved by 284 every
+  22 frames; a sidestep moved by about 1030 at its end; at the round call, up to 1355 at once. A camera turned about
+  their middle jumps with them.
+- **Framing**: from the other side the fighter in the back is in front. Turned as is, 56 of 3874 fight frames had a
+  fighter off player 2's screen (screen x 1.0 to 1.01) while he was within 0.9 on player 1's. So the turned eye moves
+  back along the view when a fighter would be farther out than 0.85 of the half width and than on player 1's
+  screen: per fighter `|x| / widest - (2 len - z)` (x, z: across and along player 1's view from his eye, len: eye to
+  target, widest: the larger `|x| / z` of the two, at least `0.85 / P[0][0]`). It is eased: half of the gap a frame
+  going back, 0.05 coming in. Then 0 of 4666 frames.
+- **Known bug, not fixed**: half of the gap a frame makes the move back nearly instant. Unlike the game's own camera it
+  looks like a jump.
+- Player 2's side is turned in both games, so both players need 0.3. Until player 1's input carries the capable
+  mark, player 2's camera is not turned.
+
 ## The HUD
 
 - The `tk::sprite::battle` sprites take their position from a placement table at `0x82011390`: 110 entries of
@@ -116,8 +136,8 @@ Approaches that failed before 0.1:
   - The table is read-only image data, so it needs `VirtualProtect`; writing without it crashed the game.
   - The HUD code picks the left or the right entry of a pair by the player's side.
   - Entries 0 and 1 have x = 187.0 and 1089.0 as built. That tells whether the table is swapped.
-- 50 left / right pairs are swapped while the picture is mirrored and swapped back for other frames. The table is not
-  game state (no snapshot brings an old state back).
+- 49 left / right pairs are swapped while player 2's view is turned and swapped back for other frames. The table is
+  not game state (no snapshot brings an old state back).
   - Most pairs are neighbours. The exceptions are `{35, 37}`, `{36, 38}`, `{45, 47}` and `{46, 48}`.
   - Entries 24, 55, 56 and 57 are centred and have no pair.
 - **Health gauges** (`CGaugeTcb_t`, vtable `0x82011C5C`, side at `+84`, draw `sub_822EC570`) use placements 6, 7 and
@@ -125,7 +145,13 @@ Approaches that failed before 0.1:
   - Swapping those placements makes the fills vanish, because the fill offsets `+124` and `+128` belong to the side.
   - Instead, the gauges keep their placements, and their values `+92` (damage trail), `+100` (fill) and `+108` are
     swapped between the two gauge tasks around the draw root only.
-- **Low-health glow**: a child task (vtable `0x82011C88`, side at `+132`, draw `sub_822EC948`) using pair `{8, 9}`.
+- **Low-health glow**: a child task (vtable `0x82011C88`, side at `+132`, draw `sub_822EC948`). Its draw takes
+  placement `8 + side` and an x offset by side (the float at `0x82011C2C` for side 0, at `0x820074F8` for side 1).
+  - 0.2 swapped placements 8 and 9 with the other pairs. The glow then sat off its bar, out at the screen edge (12 of
+    105 screenshot pairs with HUD in a 0.2 run).
+  - Instead, the glow keeps its placements and its side word is flipped around the draw root only.
+  - `sub_822EC948` was the only side-dependent geometry found among the 22 functions that call the placement helpers
+    `sub_822EA120`-`sub_822EB1C8` (read by hand after an automated first pass that missed it).
 - The battle HUD main task is `CMainTcb_t`, vtable `0x82011BAC`.
 
 ## A fighter's side
@@ -156,28 +182,24 @@ Hardware watchpoints on player 2's words `+0x284`, `+0x288` and `+0x28C` over 25
 ## Sidesteps
 
 The input side `+652` decides both left / right → forward / back and which way up sidesteps: always into the
-background of the camera the game simulates with. The mirror keeps the background where it is, so with 0.2 only
-left / right are swapped in player 2's input (d-pad and left stick x, before GGPO gets it). Both games simulate that
-same input; the fight is unchanged.
+background of the camera the game simulates with, player 1's. From the other side that background is player 2's
+foreground. In the input, up is both the sidestep (tap) and the jump (hold); the two only differ after the press, so
+no input swap can pick the other sidestep without breaking jump and crouch or adding lag.
 
-Scripted input on player 2 (hold right 60 frames, then two taps of up), 0.2 on both sides: each sidestep moves him
-about −1000 across the fight axis, the same direction as without the DLL, which is the background in both pictures.
-Holding right walks him toward player 1. 0 of 4320 frames desynced.
+0.3 (like 0.1) turns player 2's `+652` (`^ 1`) right after `sub_822A4510` in both games, for the frames whose
+synchronized input of player 2 says so. With the turned side, right is also forward, so the input is not changed.
+The two DLLs agree on it through byte 15 of the 16-byte GGPO input (the game reads only the first 12):
 
-**0.1, for the record.** With the turned camera, player 2's background was the game's foreground. In the input, up
-is both the sidestep (tap) and the jump (hold); the two only differ after the press, so no input swap can pick the
-other sidestep without breaking jump and crouch or adding lag. 0.1 turned player 2's `+652` (`^ 1`) right after
-`sub_822A4510` in both games instead, which flips the sidestep (about −1180 → +1410 to +1600 per sidestep; 0 of 4058
-frames desynced). The two DLLs agreed on it through byte 15 of the 16-byte GGPO input (the game reads only the first
-12):
+- every DLL ORs `0x01` (capable) into its player's input;
+- player 2's DLL ORs `0x02` (side turned) while his camera is turned, which needs player 1's input to carry `0x01`;
+- both games turn `+652` of the fighter with index 1 for frames whose synchronized input of player 2 carries `0x02`.
 
-- every 0.1 DLL ORs `0x01` (capable) into its player's input;
-- player 2's 0.1 DLL ORs `0x02` (side turned) while his camera is turned and player 1's input carries `0x01`;
-- both games flip `+652` of the fighter with index 1 for frames whose synchronized input of player 2 carries `0x02`.
+Scripted with `test/probe.cpp` (player 2 holds right 60 frames, taps up, taps down, every 240 frames; player 1
+stands): each up moved player 2 +817 to +956 into his screen within 55 frames, each down −893 to −948 out of it;
+holding right walked him 441 to 1389 toward player 1. 0 of 6429 frames desynced.
 
-0.2 neither sets nor reads these bits and changes no simulation state. With 0.1 on one side and 0.2 on the other,
-`0x02` is never sent, so neither game flips `+652` and the games stay in sync. [INFERENCE: reasoned from both
-versions' code; mixed versions were not run together.]
+0.2 (mirror) only swapped left / right in player 2's input; it sets and reads no marks, so 0.3 against 0.2 turns
+nothing. 0.1 and 0.3 use the same marks. [INFERENCE: reasoned from the code; mixed versions were not run together.]
 
 ## Testing setup
 
@@ -187,10 +209,16 @@ Two instances on one PC through the port's netplay switches (`T6_NET=1`, `T6_NET
 - **Desync check**: the per-frame players hash and RNG columns of both `fight_state.csv` files.
 - **Byte diffs**: `T6_NET_PLAYER_DUMP=1` writes the player objects of every confirmed frame.
 - **Screenshots**: `PrintWindow`.
+- **`test/match_test.py`**: two instances with `test/probe.cpp` (this DLL plus the scripted input above and a line
+  per drawn frame: positions, their screen x through the drawn view-projection, the drawn camera). It checks the
+  log line, the desync, that player 2's camera is turned in his game only, both fighters on his screen whenever they
+  are on player 1's, player 2 on the left whenever player 1 is on the left of his, walking and sidesteps, and the red
+  of the HUD's bar rows (frames, damage, glow) at the swapped side in the screenshots.
 - **Watchpoints**: debug registers set on the game threads from a test DLL, with hits mapped back to guest functions
   through `.pdata` and `PPCFuncMappings`.
 
 ## Open
 
+- The camera's move back is nearly instant (see [The turned camera (0.3)](#the-camera)).
 - A real online match over the internet.
-- Visual check of the low-health glow `{8, 9}`.
+- Only one stage was tested (the one `menu_vs.bin` picks), none with walls behind player 2's camera.
