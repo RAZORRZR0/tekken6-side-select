@@ -41,8 +41,7 @@ address.
 2. From it, find its type info.
 3. From that, find the vtable with offset-to-top 0.
 4. Check slot 4 (`AddLocalInput`): it must load (`lea`) the string "setting local connect status for local queue".
-5. Slot 5 is `SyncInput`. The slot order comes from `backends/backend.h`: `~D1`, `~D0`, `DoPoll`, `AddPlayer`,
-   `AddLocalInput`, `SyncInput`.
+   The slot order comes from `backends/backend.h`: `~D1`, `~D0`, `DoPoll`, `AddPlayer`, `AddLocalInput`.
 
 ## Game state used
 
@@ -53,24 +52,62 @@ address.
 | Player index | player `+76`: 0 or 1, read from pad 8 or 9 |
 | Task tree | root `0x82828C60`, child / sibling links at `+16..+40`; task objects in `0xA7290000-0xABA90000` |
 
-## The camera
+## The camera and the mirror
 
 - The camera manager `sub_8231C488` sets up the views once a frame, the active camera first, through `sub_8231CFE0`.
   That call has lr `0x8231C7FC`.
 - The camera object holds the eye at `+96`, the target at `+112` and up at `+128`.
-- The draw root `tcb_drawroot_t` (`0x8221CA68`) runs right after.
-- Turning half round about the up axis through the target: `eye' = target + 2 (d.u) u - d`, where `d = eye - target`
-  and `u` is the unit up vector.
-- The eye is turned for the active camera's view setup and again for the draw root, and put back after each. View,
-  culling and lighting all see one consistent turned camera.
+- `sub_8231CFE0(cam)` tail-calls `sub_82307CF0(cam + 96, cam + 224, cam + 288, cam + 160)`. That function:
+  1. builds the perspective matrix with `sub_82516430` and stores it at `cam + 224`;
+  2. builds the look-at matrix with `sub_82515C10` (lr `0x82307D8C`) and stores it at `cam + 288`;
+  3. multiplies them in the VMX registers `v92-v95` (the current matrix of the engine's matrix library) and stores
+     the result at `cam + 160`.
+- The matrices are row-vector (`clip = v M`), row-major, 16 big-endian floats. Read from a fight:
+  `P = [2.1446 0 0 0 | 0 3.8126 0 0 | 0 0 -1 -1 | 0 0 -100 0]`, and `cam + 160` equals `V · P`.
+- The draw root `tcb_drawroot_t` (`0x8221CA68`) runs right after. It doesn't call the cull mode setter below. All
+  of that setter's calls come from another thread, so the draw root seems to only fill draw lists.
+- The fight reads only the camera's eye (`sub_82319688` returns `cam + 96`, used by `sub_82309D30` for the sides),
+  not its matrices.
 
-Approaches that failed:
+**The mirror (0.2).** For the draw root, the x column of `cam + 160` and `cam + 224` is negated (floats 0, 4, 8, 12;
+for a big-endian float that is bit 7 of its first byte), and put back after it. `clip.x → −clip.x` mirrors the
+picture left to right. Every triangle then winds the other way, so culling has to take the other side:
+
+- `sub_824D0350` is `D3DDevice_SetRenderState_CullMode(device, value)`. It puts the value into the low 3 bits of
+  `device + 10568` (PA_SU_SC_MODE_CNTL: cull front 1, cull back 2, front face 4) and sets the dirty bit `0x40` of the
+  u64 at `device + 16`. In a fight the game passes almost only `D3DCULL_CW` 2 and none 0, a few hundred calls a frame.
+- The neighbours fit the same register: `sub_824D0370` is the getter (no direct callers), `sub_824D0380` sets the
+  fill mode (bits 3-10), and `sub_824D0E58` / `sub_824D0F20` set the polygon offset enables (bits 11, 12).
+- Every culling value set between one draw root and the next (`value & 3 != 0`) gets its front face bit flipped
+  (`^ 4`).
+
+Results (two local instances, P1's screen as built):
+
+| Run | P2's picture | Desync |
+|---|---|---|
+| Matrices mirrored, culling as built | mirrored, but the sky missing (black) and the characters' colours wrong | 0 of 4074 frames |
+| Matrices mirrored, culling flipped | exact mirror of P1's screen; HUD readable; round call, KO, replay, win pose correct | 0 of 4320 frames |
+| Same, P1 without the DLL (`T6_SIDE_SWAP=0`), random input | as above | 0 of 4238 frames |
+
+**The turned camera (0.1).** Version 0.1 turned the active camera half round about its up axis through its target
+(`eye' = target + 2 (d.u) u - d`, `d = eye - target`) for the view setup and the draw root. That has two flaws the
+mirror doesn't have:
+
+- **Framing.** Reported by a player: when player 1 backed far away, he ended up behind player 2's turned camera.
+  [INFERENCE: the camera's target is not the middle of the fighters, so the turned camera frames them differently.]
+- **Sidesteps.** From the other side, the game's background is player 2's foreground. Fixing that needs player 2's
+  side turned in both games' simulation (see [Sidesteps](#sidesteps)). Even then, each player sees the other's up
+  sidesteps go toward his own camera, because the two cameras face each other. Players reported the sidesteps still
+  wrong with 0.1.
+
+Approaches that failed before 0.1:
 
 - **Keeping the camera turned for the whole frame** desynced 3505 of 4164 frames. The first difference was at frame
   659, in bytes `0x287`, `0x28B` and `0x28F` of the player objects. Those are the side words below, which the game
-  computes from the camera.
+  computes from the camera's eye.
 - **The look-at function** `sub_82515C10` (lr `0x8221E7B8`) is never called in a fight.
-- **Mirroring inside** `sub_82307CF0` (lr `0x82307D8C`) gave inconsistent culling and lighting.
+- **Mirroring the look-at result** inside `sub_82307CF0` (lr `0x82307D8C`) gave wrong culling and lighting. That was
+  before the cull mode setter was known; mirroring the projection instead leaves view space as it is.
 
 ## The HUD
 
@@ -79,7 +116,7 @@ Approaches that failed:
   - The table is read-only image data, so it needs `VirtualProtect`; writing without it crashed the game.
   - The HUD code picks the left or the right entry of a pair by the player's side.
   - Entries 0 and 1 have x = 187.0 and 1089.0 as built. That tells whether the table is swapped.
-- 50 left / right pairs are swapped while the camera is turned and swapped back for unturned frames. The table is not
+- 50 left / right pairs are swapped while the picture is mirrored and swapped back for other frames. The table is not
   game state (no snapshot brings an old state back).
   - Most pairs are neighbours. The exceptions are `{35, 37}`, `{36, 38}`, `{45, 47}` and `{46, 48}`.
   - Entries 24, 55, 56 and 57 are centred and have no pair.
@@ -119,45 +156,28 @@ Hardware watchpoints on player 2's words `+0x284`, `+0x288` and `+0x28C` over 25
 ## Sidesteps
 
 The input side `+652` decides both left / right → forward / back and which way up sidesteps: always into the
-background of the camera the game simulates with. Experiment: player 2's `+652` turned right after `sub_822A4510`,
-in both games, with scripted input on player 2 (hold right 60 frames, then two taps of up):
+background of the camera the game simulates with. The mirror keeps the background where it is, so with 0.2 only
+left / right are swapped in player 2's input (d-pad and left stick x, before GGPO gets it). Both games simulate that
+same input; the fight is unchanged.
 
-| | Up tap: movement across the fight axis | Holding right | Desync |
-|---|---|---|---|
-| as built | about −1180 per sidestep | back | 0 of 4084 frames |
-| `+652` turned | about +1410 to +1600 per sidestep | forward | 0 of 4058 frames |
+Scripted input on player 2 (hold right 60 frames, then two taps of up), 0.2 on both sides: each sidestep moves him
+about −1000 across the fight axis, the same direction as without the DLL, which is the background in both pictures.
+Holding right walks him toward player 1. 0 of 4320 frames desynced.
 
-**Why this can't be fixed on player 2's side alone.** Player 2's turned view has the game's background in front. In
-the input, up is both the sidestep (tap) and the jump (hold). The two only differ after the press.
+**0.1, for the record.** With the turned camera, player 2's background was the game's foreground. In the input, up
+is both the sidestep (tap) and the jump (hold); the two only differ after the press, so no input swap can pick the
+other sidestep without breaking jump and crouch or adding lag. 0.1 turned player 2's `+652` (`^ 1`) right after
+`sub_822A4510` in both games instead, which flips the sidestep (about −1180 → +1410 to +1600 per sidestep; 0 of 4058
+frames desynced). The two DLLs agreed on it through byte 15 of the 16-byte GGPO input (the game reads only the first
+12):
 
-- To get the other sidestep, the input would have to say down on the frame of the press, before anyone can know
-  whether it is a tap or a hold.
-- If the press turns out to be a hold, the other game then sees a crouch.
-- Holding every up / down press back until it is known adds lag to jumps, crouches and every diagonal input.
+- every 0.1 DLL ORs `0x01` (capable) into its player's input;
+- player 2's 0.1 DLL ORs `0x02` (side turned) while his camera is turned and player 1's input carries `0x01`;
+- both games flip `+652` of the fighter with index 1 for frames whose synchronized input of player 2 carries `0x02`.
 
-So both games must turn player 2's side in their simulation.
-
-**Protocol (byte 15 of the 16-byte GGPO input).** The input is the XINPUT_GAMEPAD in guest byte order (12 bytes) plus
-4 bytes of padding. The game gets only the first 12 bytes; the padding bytes are 0 as sent by the port.
-
-- Every Side-select DLL ORs `0x01` (capable) into its player's input.
-- Player 2's DLL ORs `0x02` (side turned) into his input while his camera is turned and player 1's synchronized input
-  carries `0x01`.
-- Each game hooks `SyncInput`, which runs before every simulated frame, live or re-simulated. It notes whether player
-  2's input of that frame carries `0x02`.
-- After `sub_822A4510` runs for the fighter with index 1, the hook turns `+652` (`^ 1`), unless no sync happened in
-  the last 2 s (an offline fight).
-- When player 1 is not capable, player 2's DLL swaps d-pad left / right and the left stick's x in his input instead,
-  which is the 0.1 fallback, and his sidesteps stay mirrored.
-
-Results with the release DLL in two local instances (scripted input as above):
-
-| Player 1 | Sidestep on player 2's view | Desync |
-|---|---|---|
-| Side-select | into the background (turned, about +1400 per sidestep) | 0 of 3923 frames |
-| Side-select off (`T6_SIDE_SWAP=0`) | mirrored (about −950 to −1350 per sidestep) | 0 of 3990 frames |
-
-Earlier runs with random input: camera only, 0 of 4795 frames; camera and HUD, 0 of 4216 frames.
+0.2 neither sets nor reads these bits and changes no simulation state. With 0.1 on one side and 0.2 on the other,
+`0x02` is never sent, so neither game flips `+652` and the games stay in sync. [INFERENCE: reasoned from both
+versions' code; mixed versions were not run together.]
 
 ## Testing setup
 
@@ -172,7 +192,5 @@ Two instances on one PC through the port's netplay switches (`T6_NET=1`, `T6_NET
 
 ## Open
 
-- A mirrored picture (the camera on player 1's side, the 3D scene drawn flipped left-to-right) would fix sidesteps
-  without the opponent's DLL. The catch: everything is mirrored, and culling has to be inverted.
 - A real online match over the internet.
 - Visual check of the low-health glow `{8, 9}`.

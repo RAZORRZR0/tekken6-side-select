@@ -1,16 +1,11 @@
-// Side swap for player 2 of an online match (Tekken 7 style): his battle is seen from player 1's side - the camera on
-// the other side of the fighters - and his controls follow it, so he plays from the left like player 1. Player 1's
-// screen stays as it is; tekken6.exe and the DLLs of the launcher's build hash stay as built.
+// Side swap for player 2 of an online match (Tekken 7 style): his battle is drawn mirrored left to right, so he
+// plays from the left like player 1, and his controls follow it. Only his own game changes: the camera, the fight
+// and player 1's screen stay as they are; tekken6.exe and the DLLs of the launcher's build hash stay as built.
 //
-// His controls: the game reads a player's pad by his side on the screen (player word +652, set from the camera each
-// frame by sub_822A4510): left / right -> forward / back, and the moves' side requirements (sub_8229D3D8) pick the
-// sidestep - up is always into the background. From the other side of the fighters that background is the
-// foreground, and up still has to be jump / down crouch, so his up / down cannot be swapped; his side has to be,
-// in the simulation of both games (GGPO: they simulate the same inputs and states). So the DLLs talk in the
-// padding of the GGPO input (byte 15): every one marks its player's input kInputCapable; player 2's, once player 1's
-// input carries that mark, marks his input kInputSideTurned while his camera is turned, and both games turn player
-// 2's side for each frame whose synchronized input carries it (SyncInput -> sub_822A4510). Against a game without
-// this DLL player 2's left / right are swapped in his input instead (his sidesteps stay mirrored).
+// His controls: the game reads a player's pad by his side on the screen (left / right -> forward / back; up always
+// sidesteps into the background). Mirrored left to right his background stays the background, so only left / right
+// change: they are swapped in his input before it goes to GGPO (d-pad left / right, left stick x). Both games
+// simulate that same input: nothing of the fight changes.
 //
 // This is winmm.dll next to tekken6.exe: the exe imports winmm, so this loads before any game code runs, and every
 // winmm export is forwarded to the system DLL (winmm.def). DllMain patches the loaded exe. Nothing is found by address
@@ -18,29 +13,28 @@
 //   - guest functions by their guest address in the recompiler's guest -> host table (PPCFuncMappings): the table entry
 //     is redirected (indirect calls: the runtime builds its lookup from the table) and so are the direct calls (E8
 //     rel32 to the host function right after the store of lr)
-//   - GGPO's Peer2PeerBackend::AddLocalInput: its vtable found by RTTI, the slot checked by the function's log string;
-//     SyncInput is the next slot (backends/backend.h)
+//   - GGPO's Peer2PeerBackend::AddLocalInput: its vtable found by RTTI, the slot checked by the function's log string
 // Anything not found leaves the game unpatched. side_swap.log next to the exe says what was found; T6_SIDE_SWAP=0 in
 // the environment turns it off.
 //
-// The camera: once a frame the camera manager (sub_8231C488) sets up the views, the active camera first, and the draw
-// root (t6_resim.cpp) runs right after. The active camera is turned half round about its up axis through its target
-// for its view setup and again for the draw root, and put back after each: the draw (view, culling, lighting) sees one
-// consistent turned camera. In between the game decides the side of each player on the screen from the camera (the
-// words +0x284..+0x28C of the player objects: game state, the fight goes apart if one side computes them turned), and
-// the game's camera logic and the rollback snapshots (frame boundary) come later: they all see it as it is.
+// The mirror: once a frame the camera manager (sub_8231C488) sets up the views, the active camera first (sub_8231CFE0:
+// projection +224, view-projection +160, both row vector: clip = v M), and the draw root (t6_resim.cpp) runs right
+// after. For the draw root the x column of both matrices is negated (clip x -> -x: the picture mirrored left to right)
+// and put back after it; the fight only reads the camera's eye (sides on the screen, sub_82309D30). Mirrored, every
+// triangle turns the other way round, so the culling has to take the other side. The draw root only fills the draw
+// lists, the D3D calls come after it: until the next draw root every culling value set (cull mode setter
+// D3DDevice_SetRenderState_CullMode: D3DCULL_CW 2, D3DCULL_CCW 6) gets the other front face (face bit 4).
 //
-// The HUD (tk::sprite::battle): its sprites sit at placements {x, y, anchor, flip} of a table (guest 0x82011390,
-// read-only XEX data, 110 of them), left / right ones in pairs; the HUD code takes the left or the right one by the
-// player's side. While the camera is turned the pairs are swapped, so each player's plate, name, round marks... are
-// drawn at the other side in that side's layout. The health gauges (CGaugeTcb_t, one task per side) keep their
-// placements 6, 7 and 10 - 13 (their fill offsets +124 / +128 belong to their side: swapped, the fills vanish) and the
-// two gauges' values are swapped for the draw root instead.
+// The HUD (tk::sprite::battle) is drawn as it is, its sides swapped: its sprites sit at placements {x, y, anchor,
+// flip} of a table (guest 0x82011390, read-only XEX data, 110 of them), left / right ones in pairs; the HUD code takes
+// the left or the right one by the player's side. While mirrored the pairs are swapped, so each player's plate, name,
+// round marks... are drawn at the other side in that side's layout. The health gauges (CGaugeTcb_t, one task per side)
+// keep their placements 6, 7 and 10 - 13 (their fill offsets +124 / +128 belong to their side: swapped, the fills
+// vanish) and the two gauges' values are swapped for the draw root instead.
 
 #include <windows.h>
 
 #include <atomic>
-#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -48,25 +42,20 @@
 namespace {
 
 constexpr uint32_t kDrawRoot = 0x8221CA68u;       // tcb_drawroot_t: the frame's draw subtree walk and draw pass
-constexpr uint32_t kViewSetup = 0x8231CFE0u;      // view from a camera object: eye +96, target +112, up +128
+constexpr uint32_t kViewSetup = 0x8231CFE0u;      // view from a camera object: matrices +160, +224, +288
 constexpr uint32_t kActiveCameraLr = 0x8231C7FCu; // ... its call for the camera manager's active camera (sub_8231C488)
-constexpr uint32_t kEye = 96, kTarget = 112, kUp = 128;
+constexpr uint32_t kCamMatrices[] = {160, 224};   // view-projection, projection: 4 x 4 floats, row vectors
 constexpr uint32_t kGameMode = 0x8292E66Cu;       // t6_common.h T6GameMode()
-constexpr uint32_t kSideUpdate = 0x822A4510u;     // a fight player's frame: +652 from the camera, then his pad
-constexpr uint32_t kPlayerIndex = 76, kInputSide = 652;  // fight player: 0 / 1 (pad 8 / 9); 0 left, 1 right
-// rexglue PPCContext: r3 +0x00, lr +0x100 (each call site stores lr there before the call)
-constexpr size_t kR3 = 0x00, kLr = 0x100;
-// GGPOSession's virtual functions (backends/backend.h, Itanium ABI): ~D1, ~D0, DoPoll, AddPlayer, AddLocalInput,
-// SyncInput
-constexpr int kAddLocalInputSlot = 4, kSyncInputSlot = 5;
+constexpr uint32_t kCullMode = 0x824D0350u;       // D3DDevice_SetRenderState_CullMode(device, value)
+// rexglue PPCContext: r3 +0x00, r4 +0x20, lr +0x100 (each call site stores lr there before the call)
+constexpr size_t kR3 = 0x00, kR4 = 0x20, kLr = 0x100;
+// GGPOSession's virtual functions (backends/backend.h, Itanium ABI): ~D1, ~D0, DoPoll, AddPlayer, AddLocalInput
+constexpr int kAddLocalInputSlot = 4;
 constexpr char kAddLocalInputLog[] = "setting local connect status for local queue";  // p2p.cpp AddLocalInput
 constexpr char kP2pTypeName[] = "16Peer2PeerBackend";                                  // its RTTI name
-// GGPO input of a player: XINPUT_GAMEPAD in guest byte order + padding (t6_netplay_internal.h kNetInput; the game
-// gets the first 12 bytes), the marks in the last byte
-constexpr int kNetInput = 16, kMarks = 15;
-constexpr uint8_t kInputCapable = 0x01;     // this DLL runs the game of the input's player
-constexpr uint8_t kInputSideTurned = 0x02;  // player 2's input: his side is turned
-constexpr uint64_t kRecentMs = 2000;  // "running": player 2's input went to GGPO / a turned draw / a sync, this recently
+// GGPO input of a player: XINPUT_GAMEPAD in guest byte order + padding (t6_netplay_internal.h kNetInput)
+constexpr int kNetInput = 16;
+constexpr uint64_t kRecentMs = 2000;  // "running": player 2's input went to GGPO / a mirrored draw, this recently
 constexpr uint32_t kHudPlacements = 0x82011390u;
 constexpr uint32_t kHudX0 = 0x433B0000u, kHudX1 = 0x44882000u;  // x of placements 0 / 1 as built: 187.0, 1089.0
 // left / right placement pairs (same y, x mirrored about the middle; not the gauges' 6, 7, 10 - 13; 8 / 9 is the
@@ -84,32 +73,19 @@ constexpr uint32_t kGaugeValues[] = {92, 100, 108};  // what its draw shows: dam
 
 using GuestFn = void (*)(uint8_t* ctx, uint8_t* base);
 using AddLocalInputFn = int (*)(void* self, int player, void* values, int size);
-using SyncInputFn = int (*)(void* self, void* values, int size, int* disconnect_flags);
 
-GuestFn g_draw_root, g_view_setup, g_side_update;
+GuestFn g_draw_root, g_view_setup, g_cull_mode;
 AddLocalInputFn g_add_local_input;
-SyncInputFn g_sync_input;
 std::atomic<uint64_t> g_p2_input_ms{0};  // GetTickCount64 of the last local input of player 2
-std::atomic<uint64_t> g_turned_ms{0};    // ... of the last turned camera
-std::atomic<uint64_t> g_p1_capable_ms{0};  // ... of the last synchronized input of player 1 marked kInputCapable
-std::atomic<uint64_t> g_sync_ms{0};        // ... of the last synchronized input
-std::atomic<bool> g_p2_side_turned{false};  // the last synchronized input of player 2 is marked kInputSideTurned
+std::atomic<uint64_t> g_mirrored_ms{0};  // ... of the last mirrored draw
 std::atomic<uint8_t*> g_base{nullptr};   // guest memory base (from the view setups)
-// (main thread: the view setups and the draw root run there)
-uint32_t g_turn_cam = 0;    // guest address of the camera object to turn for this frame's draw root (0: none)
-uint32_t g_turned_eye = 0;  // guest address of the turned eye (0: none) and its bytes before
-uint8_t g_saved_eye[12];
+uint32_t g_mirror_cam = 0;  // main thread (view setups, draw root): the camera object to mirror for this frame's draw
+std::atomic<bool> g_mirrored{false};  // the last draw root drew mirrored (read by the render thread's D3D calls)
 
 uint32_t Be32(const uint8_t* p) {
   uint32_t v;
   std::memcpy(&v, p, 4);
   return _byteswap_ulong(v);
-}
-float BeF(const uint8_t* p) {
-  const uint32_t v = Be32(p);
-  float f;
-  std::memcpy(&f, &v, 4);
-  return f;
 }
 uint32_t U32(const uint8_t* ctx, size_t off) {  // the low word of a 64-bit register / lr
   uint32_t v;
@@ -126,42 +102,24 @@ bool Swapped(const uint8_t* base) {
   return mode == 3 || mode == 4 || mode == 5 || mode == 6 || mode == 10;
 }
 
-void PutBackEye(uint8_t* base) {
-  if (g_turned_eye) std::memcpy(base + g_turned_eye, g_saved_eye, 12);
-  g_turned_eye = 0;
-}
-
-// eye' = target + 2 (d.u) u - d, d = eye - target, u = unit up
-void TurnEye(uint8_t* base, uint32_t cam) {
-  float e[3], t[3], u[3];
-  for (int i = 0; i < 3; i++) {
-    e[i] = BeF(base + cam + kEye + 4 * i);
-    t[i] = BeF(base + cam + kTarget + 4 * i);
-    u[i] = BeF(base + cam + kUp + 4 * i);
-  }
-  const float len2 = u[0] * u[0] + u[1] * u[1] + u[2] * u[2];
-  if (!(len2 > 1e-12f) || !std::isfinite(len2)) return;
-  const float d[3] = {e[0] - t[0], e[1] - t[1], e[2] - t[2]};
-  const float along = (d[0] * u[0] + d[1] * u[1] + d[2] * u[2]) / len2;
-  std::memcpy(g_saved_eye, base + cam + kEye, 12);
-  g_turned_eye = cam + kEye;
-  for (int i = 0; i < 3; i++) {
-    const float v = t[i] + 2.0f * along * u[i] - d[i];
-    uint32_t bits;
-    std::memcpy(&bits, &v, 4);
-    bits = _byteswap_ulong(bits);
-    std::memcpy(base + g_turned_eye + 4 * i, &bits, 4);
-  }
-  g_turned_ms.store(GetTickCount64(), std::memory_order_relaxed);
+// x column (floats 0, 4, 8, 12) of the camera's matrices negated: the sign bit is the first byte of a big-endian float
+void MirrorX(uint8_t* base, uint32_t cam) {
+  for (const uint32_t m : kCamMatrices)
+    for (uint32_t row = 0; row < 4; row++) base[cam + m + 16 * row] ^= 0x80;
 }
 
 void ViewSetupHook(uint8_t* ctx, uint8_t* base) {
-  if (U32(ctx, kLr) != kActiveCameraLr) return g_view_setup(ctx, base);
-  g_base.store(base, std::memory_order_relaxed);
-  g_turn_cam = Swapped(base) ? U32(ctx, kR3) : 0;
-  if (g_turn_cam) TurnEye(base, g_turn_cam);
+  if (U32(ctx, kLr) == kActiveCameraLr) {
+    g_base.store(base, std::memory_order_relaxed);
+    g_mirror_cam = Swapped(base) ? U32(ctx, kR3) : 0;
+  }
   g_view_setup(ctx, base);
-  PutBackEye(base);
+}
+
+// Culling values of a mirrored frame get the other front face
+void CullModeHook(uint8_t* ctx, uint8_t* base) {
+  if (g_mirrored.load(std::memory_order_relaxed) && (ctx[kR4] & 3)) ctx[kR4] ^= 4;
+  g_cull_mode(ctx, base);
 }
 
 // Placement pairs swapped (on) or as built. Checked on the table itself: it stays as it is between frames and is no
@@ -217,65 +175,37 @@ void SwapGaugeValues(uint8_t* base, const uint32_t g[2]) {
 }
 
 void DrawRootHook(uint8_t* ctx, uint8_t* base) {
-  const bool turned = g_turn_cam != 0;
-  SetHudSwapped(base, turned);
+  const uint32_t cam = g_mirror_cam;
+  g_mirror_cam = 0;
+  g_mirrored.store(cam != 0, std::memory_order_relaxed);
+  SetHudSwapped(base, cam != 0);
+  if (!cam) return g_draw_root(ctx, base);
   uint32_t gauges[2];
-  const bool swap_gauges = turned && FindGauges(base, gauges);
+  const bool swap_gauges = FindGauges(base, gauges);
   if (swap_gauges) SwapGaugeValues(base, gauges);
-  if (turned) TurnEye(base, g_turn_cam);
-  g_turn_cam = 0;
+  MirrorX(base, cam);
   g_draw_root(ctx, base);
-  PutBackEye(base);
+  MirrorX(base, cam);
   if (swap_gauges) SwapGaugeValues(base, gauges);
+  g_mirrored_ms.store(GetTickCount64(), std::memory_order_relaxed);
 }
 
-// GGPO's handle of player n is n (p2p.h QueueToPlayerHandle). The marks go into GGPO's copy of the input; the game's
-// buffer stays as read (its press latching compares the next read with it). Player 2 with a turned camera: his side
-// turned in both games (player 1's game marked kInputCapable), else his d-pad left / right and left stick x swapped
-// (no changed input with an unturned view).
+// GGPO's handle of player n is n (p2p.h QueueToPlayerHandle). The swap goes into GGPO's copy of the input; the game's
+// buffer stays as read (its press latching compares the next read with it). Player 2 with a mirrored picture: his
+// d-pad left / right and left stick x swapped.
 int AddLocalInputHook(void* self, int player, void* values, int size) {
+  if (size != kNetInput || player != 2) return g_add_local_input(self, player, values, size);
+  g_p2_input_ms.store(GetTickCount64(), std::memory_order_relaxed);
+  if (!Recent(g_mirrored_ms) || !Swapped(g_base.load(std::memory_order_relaxed)))
+    return g_add_local_input(self, player, values, size);
   uint8_t pad[kNetInput];
-  if (size != kNetInput) return g_add_local_input(self, player, values, size);
   std::memcpy(pad, values, size);
-  pad[kMarks] |= kInputCapable;
-  if (player == 2) {
-    g_p2_input_ms.store(GetTickCount64(), std::memory_order_relaxed);
-    if (Recent(g_turned_ms) && Swapped(g_base.load(std::memory_order_relaxed))) {
-      if (Recent(g_p1_capable_ms)) {
-        pad[kMarks] |= kInputSideTurned;
-      } else {
-        if (const uint8_t dpad = pad[1] & 0x0C; dpad == 0x04 || dpad == 0x08) pad[1] ^= 0x0C;  // DPAD_LEFT 4, RIGHT 8
-        const int16_t lx = static_cast<int16_t>(pad[4] << 8 | pad[5]);
-        const int16_t mx = lx == INT16_MIN ? INT16_MAX : static_cast<int16_t>(-lx);
-        pad[4] = static_cast<uint8_t>(static_cast<uint16_t>(mx) >> 8);
-        pad[5] = static_cast<uint8_t>(mx);
-      }
-    }
-  }
+  if (const uint8_t dpad = pad[1] & 0x0C; dpad == 0x04 || dpad == 0x08) pad[1] ^= 0x0C;  // DPAD_LEFT 4, RIGHT 8
+  const int16_t lx = static_cast<int16_t>(pad[4] << 8 | pad[5]);
+  const int16_t mx = lx == INT16_MIN ? INT16_MAX : static_cast<int16_t>(-lx);
+  pad[4] = static_cast<uint8_t>(static_cast<uint16_t>(mx) >> 8);
+  pad[5] = static_cast<uint8_t>(mx);
   return g_add_local_input(self, player, pad, size);
-}
-
-// values = both players' inputs of the frame the game runs next (live or re-simulated: every frame of a session gets
-// them first, t6_session.cpp SyncInputs)
-int SyncInputHook(void* self, void* values, int size, int* disconnect_flags) {
-  const int r = g_sync_input(self, values, size, disconnect_flags);
-  if (r != 0 || size != 2 * kNetInput) return r;  // (GGPO_OK 0)
-  const auto* in = static_cast<const uint8_t*>(values);
-  const uint64_t now = GetTickCount64();
-  if (in[kMarks] & kInputCapable) g_p1_capable_ms.store(now, std::memory_order_relaxed);
-  g_p2_side_turned.store((in[kNetInput + kMarks] & kInputSideTurned) != 0, std::memory_order_relaxed);
-  g_sync_ms.store(now, std::memory_order_relaxed);
-  return r;
-}
-
-// After the game set the player's side from the camera: player 2's turned if his input of this frame says so (the
-// sync right before; none for a while = no session, an offline fight stays as it is)
-void SideUpdateHook(uint8_t* ctx, uint8_t* base) {
-  const uint32_t pl = U32(ctx, kR3);
-  g_side_update(ctx, base);
-  if (!g_p2_side_turned.load(std::memory_order_relaxed) || !Recent(g_sync_ms) || Be32(base + pl + kPlayerIndex) != 1) return;
-  const uint32_t side = _byteswap_ulong(Be32(base + pl + kInputSide) ^ 1);
-  std::memcpy(base + pl + kInputSide, &side, 4);
 }
 
 // ---- the loaded exe ----
@@ -492,7 +422,7 @@ void Install() {
   if (!e.Load()) return Log("side swap: not patched - the exe is not an x64 image with .pdata\n");
   GuestHook hooks[3] = {{kDrawRoot, reinterpret_cast<void*>(&DrawRootHook), &g_draw_root},
                         {kViewSetup, reinterpret_cast<void*>(&ViewSetupHook), &g_view_setup},
-                        {kSideUpdate, reinterpret_cast<void*>(&SideUpdateHook), &g_side_update}};
+                        {kCullMode, reinterpret_cast<void*>(&CullModeHook), &g_cull_mode}};
   char line[320];
   for (GuestHook& h : hooks)
     if (!h.Find(e)) {
@@ -500,20 +430,14 @@ void Install() {
       return Log(line);
     }
   if (hooks[1].ncalls == 0) return Log("side swap: not patched - no call of the view setup found\n");
-  if (hooks[2].ncalls == 0) return Log("side swap: not patched - no call of the side update found\n");
   void** slot = AddLocalInputSlot(e);
   if (!slot) return Log("side swap: not patched - GGPO Peer2PeerBackend::AddLocalInput not found\n");
-  void** sync_slot = slot + (kSyncInputSlot - kAddLocalInputSlot);
-  Range sync_fn;
-  if (!e.text.Has(reinterpret_cast<uint64_t>(*sync_slot)) || !e.Function(static_cast<const uint8_t*>(*sync_slot), sync_fn))
-    return Log("side swap: not patched - GGPO Peer2PeerBackend::SyncInput not found\n");
   uint8_t* page = NearPage(e);
   if (!page) return Log("side swap: not patched - no memory near the exe for the call stubs\n");
 
   g_add_local_input = reinterpret_cast<AddLocalInputFn>(*slot);
-  g_sync_input = reinterpret_cast<SyncInputFn>(*sync_slot);
-  void* const slot_hooks[2] = {reinterpret_cast<void*>(&AddLocalInputHook), reinterpret_cast<void*>(&SyncInputHook)};
-  if (!Write(slot, slot_hooks, sizeof(slot_hooks))) return Log("side swap: not patched - vtable not writable\n");
+  void* const slot_hook = reinterpret_cast<void*>(&AddLocalInputHook);
+  if (!Write(slot, &slot_hook, sizeof(slot_hook))) return Log("side swap: not patched - vtable not writable\n");
   int done[3];
   for (int i = 0; i < 3; i++) done[i] = hooks[i].Install(page + 16 * i);
   DWORD old;
@@ -521,11 +445,11 @@ void Install() {
   FlushInstructionCache(GetCurrentProcess(), page, 48);
   const auto rva = [&](const void* p) { return static_cast<unsigned long long>(static_cast<const uint8_t*>(p) - e.base); };
   std::snprintf(line, sizeof(line),
-                "side swap: on - draw root +%llX (%d of %d calls + table), view setup +%llX (%d of %d calls + table), "
-                "side update +%llX (%d of %d calls + table), AddLocalInput +%llX, SyncInput +%llX\n",
+                "side swap: on (mirror) - draw root +%llX (%d of %d calls + table), view setup +%llX (%d of %d calls + "
+                "table), cull mode +%llX (%d of %d calls + table), AddLocalInput +%llX\n",
                 rva(reinterpret_cast<void*>(g_draw_root)), done[0] - 1, hooks[0].ncalls, rva(reinterpret_cast<void*>(g_view_setup)),
-                done[1] - 1, hooks[1].ncalls, rva(reinterpret_cast<void*>(g_side_update)), done[2] - 1, hooks[2].ncalls,
-                rva(reinterpret_cast<void*>(g_add_local_input)), rva(reinterpret_cast<void*>(g_sync_input)));
+                done[1] - 1, hooks[1].ncalls, rva(reinterpret_cast<void*>(g_cull_mode)), done[2] - 1, hooks[2].ncalls,
+                rva(reinterpret_cast<void*>(g_add_local_input)));
   Log(line);
 }
 
